@@ -40,19 +40,56 @@ export default function Home() {
     setResponse(null);
 
     try {
+      const formData = new FormData();
+      formData.append("prompt", prompt);
+
+      const uploadsMeta = {};
+
+      uploads.forEach((upload, index) => {
+        const fieldName = `upload_${index + 1}`;
+
+        if (upload.file instanceof File) {
+          formData.append(fieldName, upload.file, upload.name);
+          uploadsMeta[fieldName] = {
+            name: upload.name,
+            detail: upload.detail,
+            mimeType: upload.file.type,
+          };
+        } else if (upload.blob instanceof Blob) {
+          const fileName = upload.name ?? `upload-${index + 1}`;
+          formData.append(fieldName, upload.blob, fileName);
+          uploadsMeta[fieldName] = {
+            name: fileName,
+            detail: upload.detail,
+            mimeType: upload.blob.type,
+          };
+        } else if (typeof upload.dataUrl === "string" && upload.dataUrl) {
+          const [meta, base64Data] = upload.dataUrl.split(",");
+          const mimeMatch = /^data:(?<mime>[^;]+);base64$/i.exec(meta ?? "");
+          const mimeType = mimeMatch?.groups?.mime ?? "application/octet-stream";
+          const binary = atob(base64Data ?? "");
+          const len = binary.length;
+          const bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i += 1) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          const blob = new Blob([bytes], { type: mimeType });
+          formData.append(fieldName, blob, upload.name ?? `upload-${index + 1}`);
+          uploadsMeta[fieldName] = {
+            name: upload.name ?? `upload-${index + 1}`,
+            detail: upload.detail,
+            mimeType,
+          };
+        }
+      });
+
+      if (Object.keys(uploadsMeta).length > 0) {
+        formData.append("uploadsMeta", JSON.stringify(uploadsMeta));
+      }
+
       const res = await fetch("/api/analyze", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          prompt,
-          uploads: uploads.map(({ name, dataUrl, detail }) => ({
-            name,
-            dataUrl,
-            detail,
-          })),
-        }),
+        body: formData,
       });
 
       const result = await res.json();
@@ -103,34 +140,15 @@ export default function Home() {
       return;
     }
 
-    const readFile = (file) =>
-      new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          if (typeof reader.result !== "string") {
-            reject(new Error("Unsupported file payload."));
-            return;
-          }
-
-          resolve({
-            id: crypto.randomUUID?.() ?? `upload-${Date.now()}-${file.name}`,
-            name: file.name,
-            size: file.size,
-            dataUrl: reader.result,
-            detail: "high",
-          });
-        };
-        reader.onerror = () =>
-          reject(
-            new Error(`Failed to read "${file.name}". Please try again.`)
-          );
-
-        reader.readAsDataURL(file);
-      });
-
     try {
       setUploadError(null);
-      const filePayloads = await Promise.all(files.map(readFile));
+      const filePayloads = files.map((file) => ({
+        id: crypto.randomUUID?.() ?? `upload-${Date.now()}-${file.name}`,
+        name: file.name,
+        size: file.size,
+        detail: "high",
+        file,
+      }));
       setUploads((prev) => [...prev, ...filePayloads]);
     } catch (caught) {
       setUploadError(

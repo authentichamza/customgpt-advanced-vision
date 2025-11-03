@@ -69,43 +69,117 @@ function toDataUrl(filePath, fileBuffer) {
   return `data:${mimeType};base64,${fileBuffer.toString("base64")}`;
 }
 
+function bufferToDataUrl(buffer, mimeType = "application/octet-stream") {
+  return `data:${mimeType};base64,${buffer.toString("base64")}`;
+}
+
 function normalizeUploads(uploads = []) {
   if (!Array.isArray(uploads) || uploads.length === 0) {
     return [];
   }
 
   return uploads
-    .filter((candidate) => Boolean(candidate?.dataUrl))
     .slice(0, MAX_UPLOAD_COUNT)
     .map((upload, index) => {
-      const dataUrl = upload.dataUrl.trim();
-      const dataUrlMatch =
-        /^data:(?<mime>[^;]+);base64,(?<data>.+)$/i.exec(dataUrl);
+      const id = `upload-${index + 1}`;
+      const name = upload.name?.trim() || `Uploaded image ${index + 1}`;
+      const detail = upload.detail ?? "high";
+      const dataUrl = typeof upload.dataUrl === "string" ? upload.dataUrl.trim() : "";
+      const remoteUrl =
+        typeof upload.url === "string" ? upload.url.trim() : "";
+      const s3Key =
+        typeof upload.s3Key === "string"
+          ? trimSlashes(upload.s3Key.trim())
+          : undefined;
+      const bufferCandidate =
+        Buffer.isBuffer(upload.buffer)
+          ? upload.buffer
+          : upload.buffer instanceof ArrayBuffer
+          ? Buffer.from(upload.buffer)
+          : upload.buffer instanceof Uint8Array
+          ? Buffer.from(upload.buffer)
+          : null;
 
-      if (!dataUrlMatch?.groups?.data) {
-        throw new Error(
-          `Uploaded image #${index + 1} is missing a valid base64 data URL.`
-        );
+      if (bufferCandidate) {
+        const bytes = upload.bytes ?? bufferCandidate.length;
+        if (bytes > MAX_UPLOAD_BYTES) {
+          throw new Error(
+            `Uploaded image "${
+              upload.name ?? `#${index + 1}`
+            }" exceeds the ${MAX_UPLOAD_BYTES / (1024 * 1024)}MB limit.`
+          );
+        }
+
+        const ext = path.extname(name).toLowerCase();
+        const inferredMime =
+          typeof upload.mimeType === "string"
+            ? upload.mimeType.toLowerCase()
+            : typeof upload.type === "string"
+            ? upload.type.toLowerCase()
+            : MIME_LOOKUP[ext] ?? "application/octet-stream";
+
+        return {
+          id,
+          name,
+          detail,
+          buffer: bufferCandidate,
+          mimeType: inferredMime,
+          bytes,
+          dataUrl: dataUrl || undefined,
+        };
       }
 
-      const buffer = Buffer.from(dataUrlMatch.groups.data, "base64");
-      if (buffer.length > MAX_UPLOAD_BYTES) {
-        throw new Error(
-          `Uploaded image "${
-            upload.name ?? `#${index + 1}`
-          }" exceeds the ${MAX_UPLOAD_BYTES / (1024 * 1024)}MB limit.`
-        );
+      if (dataUrl) {
+        const dataUrlMatch =
+          /^data:(?<mime>[^;]+);base64,(?<data>.+)$/i.exec(dataUrl);
+
+        if (!dataUrlMatch?.groups?.data) {
+          throw new Error(
+            `Uploaded image #${index + 1} is missing a valid base64 data URL.`
+          );
+        }
+
+        const buffer = Buffer.from(dataUrlMatch.groups.data, "base64");
+        if (buffer.length > MAX_UPLOAD_BYTES) {
+          throw new Error(
+            `Uploaded image "${
+              upload.name ?? `#${index + 1}`
+            }" exceeds the ${MAX_UPLOAD_BYTES / (1024 * 1024)}MB limit.`
+          );
+        }
+
+        return {
+          id,
+          name,
+          detail,
+          dataUrl,
+          buffer,
+          mimeType: dataUrlMatch.groups.mime?.toLowerCase() ?? "application/octet-stream",
+          bytes: buffer.length,
+        };
       }
 
-      return {
-        id: `upload-${index + 1}`,
-        name: upload.name?.trim() || `Uploaded image ${index + 1}`,
-        detail: upload.detail ?? "high",
-        dataUrl,
-        buffer,
-        mimeType: dataUrlMatch.groups.mime?.toLowerCase() ?? "application/octet-stream",
-        bytes: buffer.length,
-      };
+      if (remoteUrl) {
+        return {
+          id,
+          name,
+          detail,
+          remoteUrl,
+        };
+      }
+
+      if (s3Key) {
+        return {
+          id,
+          name,
+          detail,
+          s3Key,
+        };
+      }
+
+      throw new Error(
+        `Upload "${name}" must include either a base64 dataUrl, direct url, or s3Key.`
+      );
     });
 }
 
@@ -144,16 +218,93 @@ async function uploadBufferToS3(buffer, mimeType) {
   return { key, url: signedUrl };
 }
 
+async function createSignedUrlForKey(key) {
+  if (!s3Client) {
+    throw new Error("AWS credentials are not configured for S3 access.");
+  }
+
+  const sanitizedKey = trimSlashes(key);
+  const signedUrl = await getSignedUrl(
+    s3Client,
+    new GetObjectCommand({
+      Bucket: AWS_BUCKET,
+      Key: sanitizedKey,
+    }),
+    { expiresIn: 60 * 60 }
+  );
+
+  return { key: sanitizedKey, url: signedUrl };
+}
+
 async function buildImageInputs(uploadPayloads) {
   const contents = [];
   const normalizedUploads = normalizeUploads(uploadPayloads);
   const uploadSummaries = [];
 
+  for (const image of schematicConfig.images) {
+    const absolutePath = path.join(
+      process.cwd(),
+      "public",
+      image.path.replace(/^\/+/, "")
+    );
+
+    const file = await fs.readFile(absolutePath);
+
+    contents.push({
+      type: "input_text",
+      text: `Reference ${image.id}: ${image.label}${
+        image.caption ? ` — ${image.caption}` : ""
+      }`,
+    });
+
+    contents.push({
+      type: "input_image",
+      image_url: toDataUrl(absolutePath, file),
+      detail: image.detail ?? "high",
+    });
+  }
+
   for (const upload of normalizedUploads) {
     let imageUrlPayload;
     let strategy;
+    const summary = {
+      id: upload.id,
+      name: upload.name,
+    };
+    if (typeof upload.bytes === "number") {
+      summary.bytes = upload.bytes;
+    }
 
-    if (s3Client) {
+    if (upload.remoteUrl) {
+      imageUrlPayload = upload.remoteUrl;
+      strategy = "remote-url";
+      summary.strategy = strategy;
+      summary.url = upload.remoteUrl;
+    }
+
+    if (!imageUrlPayload && upload.s3Key) {
+      try {
+        const presigned = await createSignedUrlForKey(upload.s3Key);
+        if (presigned?.url) {
+          imageUrlPayload = presigned.url;
+          strategy = "s3-key";
+          summary.strategy = strategy;
+          summary.key = presigned.key;
+          summary.url = presigned.url;
+        }
+      } catch (error) {
+        console.error("Failed to sign existing S3 key", {
+          error,
+          key: upload.s3Key,
+          name: upload.name,
+        });
+        throw new Error(
+          `Unable to load uploaded image "${upload.name}" from S3.`
+        );
+      }
+    }
+
+    if (!imageUrlPayload && upload.buffer && s3Client) {
       try {
         const offloadResult = await uploadBufferToS3(
           upload.buffer,
@@ -163,14 +314,9 @@ async function buildImageInputs(uploadPayloads) {
         if (offloadResult?.url) {
           imageUrlPayload = offloadResult.url;
           strategy = "s3";
-          uploadSummaries.push({
-            id: upload.id,
-            name: upload.name,
-            bytes: upload.bytes,
-            strategy,
-            key: offloadResult.key,
-            url: offloadResult.url,
-          });
+          summary.strategy = strategy;
+          summary.key = offloadResult.key;
+          summary.url = offloadResult.url;
         }
       } catch (error) {
         console.error("Failed to offload upload to S3, falling back to inline", {
@@ -181,14 +327,29 @@ async function buildImageInputs(uploadPayloads) {
     }
 
     if (!imageUrlPayload) {
-      imageUrlPayload = upload.dataUrl;
-      strategy = "inline";
-      uploadSummaries.push({
-        id: upload.id,
-        name: upload.name,
-        bytes: upload.bytes,
-        strategy,
-      });
+      const inlineDataUrl =
+        upload.dataUrl ||
+        (upload.buffer && upload.mimeType
+          ? bufferToDataUrl(upload.buffer, upload.mimeType)
+          : null);
+
+      if (inlineDataUrl) {
+        imageUrlPayload = inlineDataUrl;
+        strategy = "inline";
+        summary.strategy = strategy;
+      }
+    }
+
+    if (!imageUrlPayload) {
+      throw new Error(
+        `Unable to determine an image URL for upload "${upload.name}".`
+      );
+    }
+
+    uploadSummaries.push(summary);
+
+    if (upload.buffer) {
+      upload.buffer = undefined;
     }
 
     contents.push({
@@ -200,8 +361,6 @@ async function buildImageInputs(uploadPayloads) {
       image_url: imageUrlPayload,
       detail: upload.detail,
     });
-
-    upload.buffer = undefined;
   }
 
   return {
@@ -240,17 +399,117 @@ export async function POST(req) {
     );
   }
 
-  let body;
-  try {
-    body = await req.json();
-  } catch {
-    return NextResponse.json(
-      { error: "Invalid JSON payload." },
-      { status: 400 }
-    );
-  }
+  const contentType = req.headers.get("content-type") ?? "";
+  let question = "";
+  let uploadPayloads = [];
 
-  const question = body.prompt?.trim();
+  if (contentType.includes("multipart/form-data")) {
+    let formData;
+    try {
+      formData = await req.formData();
+    } catch (error) {
+      console.error("Failed to parse multipart form data", error);
+      return NextResponse.json(
+        { error: "Invalid multipart form payload." },
+        { status: 400 }
+      );
+    }
+
+    const promptField = formData.get("prompt") ?? formData.get("question");
+    const FileCtor = globalThis.File;
+    if (typeof promptField === "string") {
+      question = promptField.trim();
+    } else if (FileCtor && promptField instanceof FileCtor) {
+      const promptText = await promptField.text();
+      question = promptText.trim();
+    }
+
+    const defaultDetail =
+      typeof formData.get("detail") === "string"
+        ? formData.get("detail").trim()
+        : undefined;
+
+    let uploadsMeta = {};
+    const metaField = formData.get("uploadsMeta");
+    if (typeof metaField === "string" && metaField.trim().length > 0) {
+      try {
+        uploadsMeta = JSON.parse(metaField);
+      } catch (error) {
+        console.warn("Unable to parse uploadsMeta JSON", error);
+      }
+    }
+
+    const fileEntries = [];
+    for (const [key, value] of formData.entries()) {
+      if (FileCtor && value instanceof FileCtor) {
+        fileEntries.push({ key, file: value });
+      }
+    }
+
+    let index = 0;
+    for (const { key, file } of fileEntries) {
+      const arrayBuffer = await file.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      const bytes = buffer.length;
+      if (bytes === 0) {
+        continue;
+      }
+
+      const metaSource =
+        uploadsMeta &&
+        typeof uploadsMeta === "object" &&
+        !Array.isArray(uploadsMeta)
+          ? uploadsMeta[key] ?? uploadsMeta[file.name]
+          : undefined;
+      const meta =
+        metaSource && typeof metaSource === "object" ? metaSource : {};
+
+      const detail =
+        typeof meta.detail === "string"
+          ? meta.detail
+          : defaultDetail ?? "high";
+      const displayName =
+        typeof meta.name === "string" && meta.name.trim().length > 0
+          ? meta.name.trim()
+          : file.name || `Uploaded image ${index + 1}`;
+
+      const ext = path.extname(displayName).toLowerCase();
+      const rawMime =
+        (typeof meta.mimeType === "string" && meta.mimeType.trim().length > 0
+          ? meta.mimeType.trim()
+          : file.type) ||
+        MIME_LOOKUP[ext] ||
+        "application/octet-stream";
+      const mimeType =
+        typeof rawMime === "string" && rawMime.length > 0
+          ? rawMime.trim().toLowerCase()
+          : "application/octet-stream";
+
+      uploadPayloads.push({
+        name: displayName,
+        detail,
+        buffer,
+        mimeType,
+        bytes,
+      });
+      index += 1;
+    }
+  } else {
+    let body;
+    try {
+      body = await req.json();
+    } catch {
+      return NextResponse.json(
+        { error: "Invalid JSON payload." },
+        { status: 400 }
+      );
+    }
+
+    question = body.prompt?.trim() ?? "";
+    if (Array.isArray(body.uploads)) {
+      uploadPayloads = body.uploads;
+    }
+  }
 
   if (!question) {
     return NextResponse.json(
@@ -262,7 +521,7 @@ export async function POST(req) {
   try {
     const model = process.env.OPENAI_VISION_MODEL ?? schematicConfig.model.name;
     const { contents: imageInputs, uploadSummaries } = await buildImageInputs(
-      body.uploads
+      uploadPayloads
     );
 
     const response = await openaiClient.responses.create({
