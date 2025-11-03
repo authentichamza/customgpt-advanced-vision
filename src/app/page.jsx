@@ -1,6 +1,7 @@
 "use client";
 
 import { schematicConfig } from "@/config/schematic";
+import { put } from "@vercel/blob/client";
 import Image from "next/image";
 import { useMemo, useState } from "react";
 
@@ -22,11 +23,33 @@ export default function Home() {
   const [error, setError] = useState(null);
   const [uploads, setUploads] = useState([]);
   const [uploadError, setUploadError] = useState(null);
+  const [isUploadingFiles, setIsUploadingFiles] = useState(false);
 
   const canSubmit = useMemo(
-    () => !!prompt.trim() && !isLoading,
-    [prompt, isLoading]
+    () => !!prompt.trim() && !isLoading && !isUploadingFiles,
+    [prompt, isLoading, isUploadingFiles]
   );
+
+  const requestBlobUploadToken = async (file) => {
+    const response = await fetch("/api/uploads", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        filename: file.name,
+        contentType: file.type,
+        size: file.size,
+      }),
+    });
+
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload?.error ?? "Failed to prepare upload.");
+    }
+
+    return payload;
+  };
 
   const handleSubmit = async (event) => {
     event.preventDefault();
@@ -40,56 +63,34 @@ export default function Home() {
     setResponse(null);
 
     try {
-      const formData = new FormData();
-      formData.append("prompt", prompt);
+      const validUploads = uploads.filter(
+        (upload) => typeof upload.url === "string" && upload.url.length > 0
+      );
 
-      const uploadsMeta = {};
-
-      uploads.forEach((upload, index) => {
-        const fieldName = `upload_${index + 1}`;
-
-        if (upload.file instanceof File) {
-          formData.append(fieldName, upload.file, upload.name);
-          uploadsMeta[fieldName] = {
-            name: upload.name,
-            detail: upload.detail,
-            mimeType: upload.file.type,
-          };
-        } else if (upload.blob instanceof Blob) {
-          const fileName = upload.name ?? `upload-${index + 1}`;
-          formData.append(fieldName, upload.blob, fileName);
-          uploadsMeta[fieldName] = {
-            name: fileName,
-            detail: upload.detail,
-            mimeType: upload.blob.type,
-          };
-        } else if (typeof upload.dataUrl === "string" && upload.dataUrl) {
-          const [meta, base64Data] = upload.dataUrl.split(",");
-          const mimeMatch = /^data:(?<mime>[^;]+);base64$/i.exec(meta ?? "");
-          const mimeType = mimeMatch?.groups?.mime ?? "application/octet-stream";
-          const binary = atob(base64Data ?? "");
-          const len = binary.length;
-          const bytes = new Uint8Array(len);
-          for (let i = 0; i < len; i += 1) {
-            bytes[i] = binary.charCodeAt(i);
-          }
-          const blob = new Blob([bytes], { type: mimeType });
-          formData.append(fieldName, blob, upload.name ?? `upload-${index + 1}`);
-          uploadsMeta[fieldName] = {
-            name: upload.name ?? `upload-${index + 1}`,
-            detail: upload.detail,
-            mimeType,
-          };
-        }
-      });
-
-      if (Object.keys(uploadsMeta).length > 0) {
-        formData.append("uploadsMeta", JSON.stringify(uploadsMeta));
+      if (validUploads.length !== uploads.length) {
+        throw new Error(
+          "Some uploads are incomplete. Remove failed items or retry before submitting."
+        );
       }
+
+      setUploadError(null);
 
       const res = await fetch("/api/analyze", {
         method: "POST",
-        body: formData,
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          prompt,
+          uploads: validUploads.map((upload) => ({
+            name: upload.name,
+            detail: upload.detail,
+            url: upload.url,
+            blobPathname: upload.blobPathname,
+            size: upload.size,
+            mimeType: upload.mimeType,
+          })),
+        }),
       });
 
       const result = await res.json();
@@ -140,23 +141,54 @@ export default function Home() {
       return;
     }
 
+    const successfulUploads = [];
+    let firstError = null;
+
+    setUploadError(null);
+    setIsUploadingFiles(true);
     try {
-      setUploadError(null);
-      const filePayloads = files.map((file) => ({
-        id: crypto.randomUUID?.() ?? `upload-${Date.now()}-${file.name}`,
-        name: file.name,
-        size: file.size,
-        detail: "high",
-        file,
-      }));
-      setUploads((prev) => [...prev, ...filePayloads]);
-    } catch (caught) {
-      setUploadError(
-        caught instanceof Error ? caught.message : "Failed to read file."
-      );
+      for (const file of files) {
+        try {
+          const tokenPayload = await requestBlobUploadToken(file);
+          const resolvedMime = (
+            tokenPayload.contentType ||
+            file.type ||
+            ""
+          ).toLowerCase();
+          const blob = await put(tokenPayload.pathname, file, {
+            access: "public",
+            token: tokenPayload.token,
+            contentType: resolvedMime || tokenPayload.contentType || file.type,
+          });
+
+          successfulUploads.push({
+            id: crypto.randomUUID?.() ?? `upload-${Date.now()}-${file.name}`,
+            name: file.name,
+            size: file.size,
+            detail: "high",
+            url: blob.url,
+            blobPathname: blob.pathname,
+            mimeType: resolvedMime || tokenPayload.contentType || file.type,
+          });
+        } catch (caught) {
+          if (!firstError) {
+            firstError =
+              caught instanceof Error
+                ? caught.message
+                : "Failed to upload file to storage.";
+          }
+        }
+      }
     } finally {
+      setIsUploadingFiles(false);
       event.target.value = "";
     }
+
+    if (successfulUploads.length > 0) {
+      setUploads((prev) => [...prev, ...successfulUploads]);
+    }
+
+    setUploadError(firstError);
   };
 
   const handleRemoveUpload = (id) => {
@@ -213,19 +245,34 @@ export default function Home() {
                 </span>
               </div>
               <p>
-                Optional session-only uploads (PNG/JPEG, &lt;= {MAX_UPLOAD_MB}MB each).
-                These are sent directly with the prompt and never saved to disk.
+                Optional session uploads (PNG/JPEG, &lt;= {MAX_UPLOAD_MB}MB each).
+                Files stream to Vercel Blob storage first, then only signed URLs
+                reach the model.
               </p>
-              <label className="flex cursor-pointer items-center justify-center rounded-md border border-dashed border-zinc-400 bg-white px-3 py-2 text-xs font-medium text-zinc-700 transition hover:border-zinc-500 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:border-zinc-400">
+              <label
+                className={
+                  "flex items-center justify-center rounded-md border border-dashed border-zinc-400 bg-white px-3 py-2 text-xs font-medium text-zinc-700 transition dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 " +
+                  (isUploadingFiles
+                    ? "cursor-not-allowed opacity-60"
+                    : "cursor-pointer hover:border-zinc-500 dark:hover:border-zinc-400")
+                }
+              >
                 <input
                   type="file"
                   accept=".png,.jpg,.jpeg,.webp,.tif,.tiff"
                   multiple
                   className="hidden"
+                  disabled={isUploadingFiles}
                   onChange={handleUploadChange}
                 />
-                Upload images
+                {isUploadingFiles ? "Uploading…" : "Upload images"}
               </label>
+              {isUploadingFiles ? (
+                <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                  Large files may take a few moments while they stream to blob
+                  storage.
+                </p>
+              ) : null}
               {uploadError ? (
                 <p className="rounded-md border border-red-300 bg-red-50 px-2 py-1 text-xs text-red-700 dark:border-red-700 dark:bg-red-950/60 dark:text-red-200">
                   {uploadError}

@@ -1,4 +1,12 @@
 import { schematicConfig } from "@/config/schematic";
+import {
+  EXT_LOOKUP_BY_MIME,
+  MAX_UPLOAD_BYTES,
+  MAX_UPLOAD_COUNT,
+  MIME_LOOKUP,
+  sanitizeEnv,
+  trimSlashes,
+} from "@/lib/uploads/constants";
 import { promises as fs } from "fs";
 import OpenAI from "openai";
 import { NextResponse } from "next/server";
@@ -10,31 +18,6 @@ import { randomUUID } from "crypto";
 const openaiClient = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
-
-const MIME_LOOKUP = {
-  ".png": "image/png",
-  ".jpg": "image/jpeg",
-  ".jpeg": "image/jpeg",
-  ".webp": "image/webp",
-  ".tif": "image/tiff",
-  ".tiff": "image/tiff",
-};
-
-const EXT_LOOKUP_BY_MIME = {
-  "image/png": "png",
-  "image/jpeg": "jpg",
-  "image/webp": "webp",
-  "image/tiff": "tiff",
-};
-
-const MAX_UPLOAD_BYTES = 45 * 1024 * 1024; // 45 MB hard cap per image
-const MAX_UPLOAD_COUNT = 6;
-
-const sanitizeEnv = (value) =>
-  typeof value === "string" ? value.trim().replace(/^['"]|['"]$/g, "") : undefined;
-
-const trimSlashes = (value) =>
-  typeof value === "string" ? value.replace(/^\/+|\/+$/g, "") : value;
 
 const AWS_UPLOAD_PREFIX = sanitizeEnv(process.env.AWS_VISION_PREFIX) ?? "vision-uploads";
 const AWS_REGION = sanitizeEnv(process.env.AWS_REGION) ?? "us-east-1";
@@ -91,6 +74,12 @@ function normalizeUploads(uploads = []) {
         typeof upload.s3Key === "string"
           ? trimSlashes(upload.s3Key.trim())
           : undefined;
+      const blobPathname =
+        typeof upload.blobPathname === "string"
+          ? trimSlashes(upload.blobPathname.trim())
+          : typeof upload.blobPath === "string"
+          ? trimSlashes(upload.blobPath.trim())
+          : undefined;
       const bufferCandidate =
         Buffer.isBuffer(upload.buffer)
           ? upload.buffer
@@ -99,9 +88,21 @@ function normalizeUploads(uploads = []) {
           : upload.buffer instanceof Uint8Array
           ? Buffer.from(upload.buffer)
           : null;
+      const reportedBytes =
+        typeof upload.bytes === "number" && Number.isFinite(upload.bytes)
+          ? upload.bytes
+          : typeof upload.size === "number" && Number.isFinite(upload.size)
+          ? upload.size
+          : undefined;
+      const explicitMime =
+        typeof upload.mimeType === "string"
+          ? upload.mimeType.toLowerCase()
+          : typeof upload.type === "string"
+          ? upload.type.toLowerCase()
+          : undefined;
 
       if (bufferCandidate) {
-        const bytes = upload.bytes ?? bufferCandidate.length;
+        const bytes = reportedBytes ?? bufferCandidate.length;
         if (bytes > MAX_UPLOAD_BYTES) {
           throw new Error(
             `Uploaded image "${
@@ -112,11 +113,7 @@ function normalizeUploads(uploads = []) {
 
         const ext = path.extname(name).toLowerCase();
         const inferredMime =
-          typeof upload.mimeType === "string"
-            ? upload.mimeType.toLowerCase()
-            : typeof upload.type === "string"
-            ? upload.type.toLowerCase()
-            : MIME_LOOKUP[ext] ?? "application/octet-stream";
+          explicitMime ?? MIME_LOOKUP[ext] ?? "application/octet-stream";
 
         return {
           id,
@@ -126,6 +123,7 @@ function normalizeUploads(uploads = []) {
           mimeType: inferredMime,
           bytes,
           dataUrl: dataUrl || undefined,
+          blobPathname,
         };
       }
 
@@ -156,6 +154,7 @@ function normalizeUploads(uploads = []) {
           buffer,
           mimeType: dataUrlMatch.groups.mime?.toLowerCase() ?? "application/octet-stream",
           bytes: buffer.length,
+          blobPathname,
         };
       }
 
@@ -165,6 +164,9 @@ function normalizeUploads(uploads = []) {
           name,
           detail,
           remoteUrl,
+          bytes: reportedBytes,
+          mimeType: explicitMime,
+          blobPathname,
         };
       }
 
@@ -174,6 +176,9 @@ function normalizeUploads(uploads = []) {
           name,
           detail,
           s3Key,
+          bytes: reportedBytes,
+          mimeType: explicitMime,
+          blobPathname,
         };
       }
 
@@ -275,11 +280,19 @@ async function buildImageInputs(uploadPayloads) {
       summary.bytes = upload.bytes;
     }
 
+    if (typeof upload.mimeType === "string") {
+      summary.mimeType = upload.mimeType;
+    }
+
     if (upload.remoteUrl) {
       imageUrlPayload = upload.remoteUrl;
-      strategy = "remote-url";
+      const isBlobUrl = /vercel-storage\.com/i.test(upload.remoteUrl);
+      strategy = isBlobUrl ? "vercel-blob" : "remote-url";
       summary.strategy = strategy;
       summary.url = upload.remoteUrl;
+      if (upload.blobPathname) {
+        summary.blobPathname = upload.blobPathname;
+      }
     }
 
     if (!imageUrlPayload && upload.s3Key) {
