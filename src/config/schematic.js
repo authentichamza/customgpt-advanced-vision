@@ -14,6 +14,10 @@ export const schematicConfig = {
   model: {
     name: "gpt-4.1",
     maxOutputTokens: 1024,
+    pricingUsdPerMTok: {
+      input: 2, // $15 per 1M input tokens (OpenAI pricing as of Oct 2024)
+      output: 8, // $60 per 1M output tokens
+    },
   },
   exampleQuestions: [
     "How do I get from Stair 6 to Elevator 3? Provide clear step-by-step directions.",

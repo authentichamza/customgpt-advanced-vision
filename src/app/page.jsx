@@ -7,6 +7,14 @@ import { useMemo, useState } from "react";
 const MAX_UPLOAD_MB = 12;
 const MAX_UPLOAD_COUNT = 6;
 
+const formatUsd = (amount) => {
+  if (typeof amount !== "number" || Number.isNaN(amount)) {
+    return "—";
+  }
+
+  return `$${amount.toFixed(amount < 0.01 ? 4 : 2)}`;
+};
+
 export default function Home() {
   const [prompt, setPrompt] = useState("");
   const [response, setResponse] = useState(null);
@@ -260,6 +268,20 @@ export default function Home() {
             </ul>
           </div>
 
+          {schematicConfig.model.pricingUsdPerMTok ? (
+            <div className="rounded-2xl border border-zinc-200 bg-white p-4 text-sm text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300">
+              <p className="font-medium text-zinc-900 dark:text-zinc-100">
+                Estimated pricing (per request)
+              </p>
+              <p className="mt-2 text-xs leading-relaxed">
+                Input tokens ≈ $
+                {schematicConfig.model.pricingUsdPerMTok.input} / 1M, output
+                tokens ≈ ${schematicConfig.model.pricingUsdPerMTok.output} / 1M.
+                See response footer for actual usage + USD estimate.
+              </p>
+            </div>
+          ) : null}
+
         </section>
 
         <section className="flex flex-1 flex-col gap-6">
@@ -376,6 +398,45 @@ export default function Home() {
                     {response.usage.total_tokens ?? "—"}
                   </div>
                 </div>
+                {response.costEstimate ? (
+                  <div className="flex flex-wrap items-center gap-4">
+                    <div>
+                      <span className="font-semibold">Input est.:</span>{" "}
+                      {formatUsd(response.costEstimate.inputUsd)}
+                    </div>
+                    <div>
+                      <span className="font-semibold">Output est.:</span>{" "}
+                      {formatUsd(response.costEstimate.outputUsd)}
+                    </div>
+                    <div>
+                      <span className="font-semibold">Total est.:</span>{" "}
+                      {formatUsd(response.costEstimate.totalUsd)}
+                    </div>
+                  </div>
+                ) : null}
+                {response.uploadSummaries?.length ? (
+                  <div className="flex flex-col gap-1 rounded-lg border border-zinc-200 bg-white p-3 text-[11px] text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+                    <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-200">
+                      Upload handling
+                    </span>
+                    {response.uploadSummaries.map((summary) => (
+                      <div
+                        key={summary.id}
+                        className="flex flex-wrap items-center justify-between gap-2"
+                      >
+                        <span className="font-medium">
+                          {summary.name}
+                        </span>
+                        <span className="uppercase tracking-wide text-[10px] text-blue-600 dark:text-blue-300">
+                          {summary.strategy === "s3" ? "S3 offload" : "Inline"}
+                        </span>
+                        <span className="text-[10px] text-zinc-500 dark:text-zinc-400">
+                          {(summary.bytes / (1024 * 1024)).toFixed(2)}MB
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </div>

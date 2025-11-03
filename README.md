@@ -52,10 +52,12 @@ Visit [http://localhost:3000](http://localhost:3000) and submit queries straight
 ### 5. How it works
 - `src/config/schematic.js` houses the session defaults (display name, optional static images, example questions, model settings).
 - `src/app/api/analyze/route.js` handles POST requests, loads any static images from disk, merges session uploads provided by the client, and issues a `responses.create` call to the configured vision model.
+  - Uploads larger than ~6 MB are streamed to S3 using credentials from `.env`, and the model receives a short-lived signed URL instead of an inline base64 payload. Smaller images stay inline for speed.
 - The front end (`src/app/page.jsx`) provides:
   - Prompt input and curated examples.
   - Session-scoped upload widget plus preview grid for everything headed to the model.
-  - Response viewer with token usage pulled directly from the OpenAI response.
+  - Response viewer with token usage and USD estimates derived from the configured pricing metadata.
+  - Post-response telemetry displays whether each upload was inlined or offloaded to S3.
 
 Because the schematic is attached to every request, no pre-computed summaries are required and the model always reasons over the raw imagery.
 
@@ -68,6 +70,10 @@ Because the schematic is attached to every request, no pre-computed summaries ar
   2. `gpt-4.1-mini`: lightweight exploratory option ideal for quick UX validation.
 
 Token usage per response is surfaced in the UI; consult OpenAI's pricing page for the latest cost information.
+
+**Handling large schematics with S3**
+
+Set `AWS_BUCKET_NAME`, `AWS_ACCESS_KEY_ID`, and `AWS_ACCESS_KEY_SECRET` (optionally `AWS_REGION` / `AWS_VISION_PREFIX`) in your environment to enable automatic offloading. When enabled, the API route uploads large session images to your bucket and sends a 1-hour presigned URL to OpenAI, avoiding `413 Request Entity Too Large` errors while keeping uploads private.
 
 ---
 
